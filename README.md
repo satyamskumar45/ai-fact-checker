@@ -144,3 +144,7 @@ This project is designed to demonstrate how an **AI-powered fact-checking system
 ---
 
 If you found this useful, feel free to ⭐ the repo or build on top of it! 
+=======
+# ai-fact-checker
+AI-powered Streamlit app that extracts and verifies factual claims from PDFs. Uses a structured pipeline (extract → classify → verify) to label claims as Verified, Inaccurate, or False with confidence scores, reasoning, and evidence.
+>>>>>>> c9d0fc843798c4802d49f2b217dfd6f27bf55980
