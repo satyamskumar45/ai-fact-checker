@@ -1,8 +1,9 @@
 from html import escape
+import json
+import time
 from pathlib import Path
 
 import streamlit as st
-
 from utils.claim_extractor import extract_claims
 from utils.pdf_parser import extract_text_from_pdf
 from utils.verifier import verify_claim
@@ -35,12 +36,14 @@ def status_badge(status):
 
 
 def normalize_result(result):
+    reasoning = result.get("reasoning") or result.get("reason", "No reasoning available.")
     return {
         "claim": result.get("claim", ""),
         "status": result.get("status", "Inaccurate"),
         "confidence": result.get("confidence", "Low"),
         "type": result.get("type", "Fact"),
-        "reason": result.get("reason", "No reasoning available."),
+        "reasoning": reasoning,
+        "reason": reasoning,
         "evidence": result.get("evidence", "No evidence found."),
         "source": result.get("source") or "AI Fact Checker",
     }
@@ -174,7 +177,7 @@ def main():
             text = extract_text_from_pdf(uploaded_file)
             claims = extract_claims(text)
     except Exception as e:
-        st.error(f"Error processing PDF: {e}")
+        st.error(f"Unable to process the uploaded PDF. Please ensure it is a valid, text-based PDF and try again. Details: {e}")
         return
 
     if not text.strip():
@@ -189,11 +192,14 @@ def main():
             st.write(text[:3000])
         return
 
+    # Limit claims to prevent rate limiting (max 5 claims per session)
+    claims = claims[:5]
+
     st.markdown(f'<p class="muted-copy">Found {len(claims)} claim(s) to verify.</p>', unsafe_allow_html=True)
 
     with st.spinner("\U0001f50d Analyzing and verifying claims..."):
         results = []
-        for claim in claims:
+        for index, claim in enumerate(claims):
             try:
                 result = verify_claim(claim)
             except Exception as e:
@@ -201,11 +207,17 @@ def main():
                     "status": "Inaccurate",
                     "confidence": "Low",
                     "type": "Fact",
-                    "reason": "The verifier could not complete this claim and safely fell back to manual review.",
-                    "evidence": f"Error verifying claim: {str(e)}",
+                    "reasoning": "Verification could not be completed for this claim. Please review it manually.",
+                    "reason": "Verification could not be completed for this claim. Please review it manually.",
+                    "evidence": f"An error occurred while verifying this claim: {str(e)}",
                     "source": "App error handler",
                 }
             results.append({"claim": claim, **result})
+
+            # Add 2-second delay between API calls to avoid rate limiting
+            # Skip delay after the last claim
+            if index < len(claims) - 1:
+                time.sleep(2)
 
     render_summary(results)
 
@@ -218,6 +230,14 @@ def main():
         data=build_report(results),
         file_name="fact_check_report.txt",
         mime="text/plain",
+        use_container_width=True,
+    )
+
+    st.download_button(
+        "\U0001f4e5 Download JSON Report",
+        data=json.dumps([normalize_result(result) for result in results], indent=2),
+        file_name="fact_check_report.json",
+        mime="application/json",
         use_container_width=True,
     )
 

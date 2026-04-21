@@ -1,557 +1,439 @@
-import hashlib
+import json
+import logging
+import os
 import re
-from difflib import SequenceMatcher
+import time
+from typing import Any
 
-import requests
-
-
-SEARCH_ENDPOINT = "https://api.duckduckgo.com/"
-
-NUMERIC_PATTERN = re.compile(
-    r"(\$|₹|€|£)?\s?\d{1,3}(,\d{3})*(\.\d+)?\s?(%|percent|percentage|million|billion|trillion|crore|lakh|k|m|bn)?|"
-    r"\b(19|20)\d{2}\b|\b(q[1-4]|fy)\s?\d{2,4}\b",
-    re.IGNORECASE,
-)
-STATISTIC_TERMS = {
-    "population",
-    "gdp",
-    "inflation",
-    "revenue",
-    "profit",
-    "loss",
-    "growth",
-    "market share",
-    "unemployment",
-    "rate",
-    "percentage",
-    "valuation",
-    "users",
-    "sales",
-}
-OPINION_TERMS = {
-    "best",
-    "worst",
-    "should",
-    "could",
-    "might",
-    "may",
-    "believe",
-    "think",
-    "feel",
-    "likely",
-    "unlikely",
-    "better",
-    "worse",
-    "important",
-    "significant",
-    "successful",
-    "popular",
-    "effective",
-    "innovative",
-    "leading",
-}
-FACT_TERMS = {
-    "is",
-    "are",
-    "was",
-    "were",
-    "has",
-    "have",
-    "founded",
-    "launched",
-    "created",
-    "announced",
-    "reported",
-    "located",
-    "based",
-    "released",
-    "acquired",
-    "merged",
-}
-
-KNOWN_FACTS = [
-    {
-        "label": "France capital",
-        "patterns": [r"\bparis\b.*\bcapital\b.*\bfrance\b", r"\bcapital\b.*\bfrance\b.*\bparis\b"],
-        "evidence": "Paris is the capital city of France.",
-        "domain": "geography",
-    },
-    {
-        "label": "Earth shape",
-        "patterns": [r"\bearth\b.*\bround\b", r"\bearth\b.*\bspherical\b", r"\bearth\b.*\boblate\b"],
-        "evidence": "Earth is an oblate spheroid, commonly simplified as round.",
-        "domain": "science",
-    },
-    {
-        "label": "Water boiling point",
-        "patterns": [r"\bwater\b.*\bboils\b.*\b100\b.*\b(c|celsius|degree)"],
-        "evidence": "At standard sea-level pressure, pure water boils at about 100 degrees Celsius.",
-        "domain": "science",
-    },
-    {
-        "label": "Sun classification",
-        "patterns": [r"\bsun\b.*\bstar\b"],
-        "evidence": "The Sun is a star at the center of the Solar System.",
-        "domain": "science",
-    },
-    {
-        "label": "Human heart",
-        "patterns": [r"\bhuman(s)?\b.*\bone\b.*\bheart\b", r"\bhuman(s)?\b.*\b1\b.*\bheart\b"],
-        "evidence": "A typical human has one heart.",
-        "domain": "biology",
-    },
-    {
-        "label": "Global population band",
-        "patterns": [
-            r"\b(world|global|earth)\b.*\bpopulation\b.*\b(8|eight)\b.*\bbillion\b",
-            r"\bpopulation\b.*\b(world|global|earth)\b.*\b(8|eight)\b.*\bbillion\b",
-        ],
-        "evidence": "Recent global population estimates are in the range of roughly eight billion people.",
-        "domain": "population",
-    },
-]
-
-KNOWN_CONTRADICTIONS = [
-    {
-        "label": "Flat Earth",
-        "patterns": [r"\bearth\b.*\bflat\b"],
-        "evidence": "This contradicts scientific observation and measurement showing Earth is an oblate spheroid.",
-        "domain": "science",
-    },
-    {
-        "label": "Geocentric solar system",
-        "patterns": [r"\bsun\b.*\brevolves\b.*\bearth\b", r"\bsun\b.*\borbits\b.*\bearth\b"],
-        "evidence": "Earth orbits the Sun; the Sun does not orbit Earth in the solar-system model.",
-        "domain": "science",
-    },
-    {
-        "label": "Human hearts",
-        "patterns": [r"\bhuman(s)?\b.*\bthree\b.*\bhearts\b", r"\bhuman(s)?\b.*\b3\b.*\bhearts\b"],
-        "evidence": "A typical human has one heart, not three.",
-        "domain": "biology",
-    },
-]
-
-REASONING_TEMPLATES = {
-    "Verified": [
-        "The claim aligns with a stable knowledge pattern for {topic}, and the wording does not introduce a conflicting qualifier.",
-        "This matches a widely accepted {topic} fact, so the system can verify it with high confidence.",
-        "The statement maps cleanly to an established {topic} reference pattern.",
-    ],
-    "Inaccurate": [
-        "The claim is plausible but needs authoritative validation before it can be treated as verified.",
-        "The statement contains checkable signals, but the available evidence is not strong enough for a verified label.",
-        "This claim needs source-level confirmation because the wording or figures may vary by source and date.",
-    ],
-    "False": [
-        "The claim contradicts well-established {topic} consensus and matches a known contradiction pattern.",
-        "This conflicts with a stable reference fact in {topic}, so it is classified as false.",
-        "The statement is inconsistent with accepted {topic} evidence and can be rejected by rule-based checks.",
-    ],
-}
-
-EVIDENCE_TEMPLATES = {
-    "Statistic": [
-        "The claim includes numerical or time-bound data. Exact values should be checked against primary datasets because figures can change by reporting period.",
-        "This is a measurement-style claim. Comparable reports may show similar directionality, but the exact number requires an authoritative source.",
-        "The system detected quantitative language, so it treats the claim as data-sensitive rather than making a hard contradiction call.",
-    ],
-    "Fact": [
-        "The claim is phrased as a factual statement and was evaluated against known reference patterns and lightweight evidence matching.",
-        "The system checked whether the statement resembles a stable fact, a known contradiction, or an unsupported assertion.",
-        "This was assessed as a general factual claim using pattern matching, keyword context, and available evidence overlap.",
-    ],
-    "Opinion": [
-        "The wording contains subjective or vague language, which makes it unsuitable for direct factual verification without clearer criteria.",
-        "The statement reads more like an interpretation or judgement than a claim with a single verifiable truth value.",
-        "This needs a more specific benchmark or source before it can be verified as a factual assertion.",
-    ],
-}
+import streamlit as st
+from groq import Groq
 
 
-def classify_claim(claim):
-    """Classify a claim as Statistic, Fact, or Opinion."""
-    normalized = (claim or "").strip()
-    lower_claim = normalized.lower()
+logging.basicConfig(level=logging.INFO)
+LOGGER = logging.getLogger(__name__)
 
-    if not normalized or len(normalized.split()) < 3:
+GROQ_MODEL_NAME =  "llama-3.1-8b-instant"
+MAX_CLAIM_CHARS = 1000
+MAX_EVIDENCE_CHARS = 1200
+
+STATUS_VALUES = {"Verified", "Inaccurate", "False"}
+CONFIDENCE_VALUES = {"High", "Medium", "Low"}
+CLAIM_TYPES = {"Fact", "Statistic", "Opinion"}
+
+
+def log(message: str, level: int = logging.INFO) -> None:
+    LOGGER.log(level, "[Verifier] %s", message)
+
+
+def load_api_key() -> str:
+    try:
+        api_key = st.secrets["GROQ_API_KEY"]
+        if api_key:
+            return str(api_key).strip()
+    except Exception as error:
+        log(f"Streamlit secret GROQ_API_KEY not available: {error}", logging.DEBUG)
+
+    return (os.getenv("GROQ_API_KEY") or "").strip()
+
+
+GROQ_API_KEY = load_api_key()
+
+
+def initialize_groq_client():
+    if not GROQ_API_KEY:
+        log("GROQ_API_KEY missing", logging.ERROR)
+        return None
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        log("Groq client initialized")
+        return client
+    except Exception as e:
+        log(f"Groq client init failed: {e}", logging.ERROR)
+        return None
+
+
+client = initialize_groq_client()
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def verify_claim(claim: str) -> dict[str, str]:
+    normalized_claim = clean_text(claim)
+
+    if not normalized_claim or len(normalized_claim) < 8:
+        return build_result(
+            status="Inaccurate",
+            confidence="Low",
+            claim_type="Opinion",
+            reasoning="The claim is empty or too short to verify reliably.",
+            evidence="A complete factual statement is required before Groq verification can be performed.",
+            source="Verifier validation",
+        )
+
+    if len(normalized_claim) > MAX_CLAIM_CHARS:
+        normalized_claim = normalized_claim[:MAX_CLAIM_CHARS].strip()
+
+    result = verify_with_groq(normalized_claim)
+    return calibrate_result(result)
+
+
+def call_groq_with_retry(prompt: str) -> Any:
+    """Call Groq API with exponential backoff retry logic for rate limit errors.
+
+    Retries up to 4 times with delays: 2s -> 5s -> 10s -> 20s
+    Only retries on 429 / RESOURCE_EXHAUSTED errors.
+    """
+    if client is None:
+        raise RuntimeError("Groq client is not initialized. Cannot perform API call.")
+
+    delays = [2, 5, 10, 20]
+    last_error: Exception | None = None
+
+    for attempt, delay in enumerate(delays):
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+                temperature=0.2,
+            )
+            if attempt > 0:
+                log(f"Groq API call succeeded on retry attempt {attempt + 1}")
+            return response
+        except Exception as error:
+            last_error = error
+            error_str = str(error)
+
+            if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
+                if attempt < len(delays) - 1:
+                    log(
+                        f"Rate limit hit. Retrying in {delay}s (attempt {attempt + 1}/{len(delays)})...",
+                        logging.WARNING,
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    log(
+                        f"Rate limit persisted after {len(delays)} retries. Giving up.",
+                        logging.ERROR,
+                    )
+            else:
+                raise error
+
+    raise last_error
+
+
+def verify_with_groq(claim: str) -> dict[str, str]:
+    global client
+
+    claim_type = classify_claim(claim)
+
+    if not GROQ_API_KEY:
+        log("Groq verification failed: GROQ_API_KEY is missing.", logging.ERROR)
+        return build_result(
+            status="Inaccurate",
+            confidence="Low",
+            claim_type=claim_type,
+            reasoning="Groq verification could not run because GROQ_API_KEY is missing.",
+            evidence="Set GROQ_API_KEY in Streamlit secrets or the environment to enable AI verification.",
+            source="Groq configuration error",
+        )
+
+    if client is None:
+        log("Groq client is None after key load; retrying initialization.", logging.WARNING)
+        client = initialize_groq_client()
+
+    if client is None:
+        log("Groq verification failed: client is None even though an API key exists.", logging.ERROR)
+        return build_result(
+            status="Inaccurate",
+            confidence="Low",
+            claim_type=claim_type,
+            reasoning="Groq verification could not run because the Groq client failed to initialize.",
+            evidence="The API key was found, but the Groq client could not be created.",
+            source="Groq initialization error",
+        )
+
+    prompt = build_groq_prompt(claim, claim_type)
+
+    try:
+        response = call_groq_with_retry(prompt)
+    except Exception as error:
+        error_str = str(error)
+        log(f"Groq API call failed: {error}", logging.ERROR)
+
+        if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
+            return build_result(
+                status="Inaccurate",
+                confidence="Low",
+                claim_type=claim_type,
+                reasoning="Rate limit exceeded. Please retry shortly.",
+                evidence="Groq API quota exceeded. Free tier limits have been reached. Please try again later.",
+                source="Groq API - Rate Limited",
+            )
+
+        return build_result(
+            status="Inaccurate",
+            confidence="Low",
+            claim_type=claim_type,
+            reasoning="Groq verification failed while generating a response.",
+            evidence=f"Groq API error: {error}",
+            source="Groq API error",
+        )
+
+    raw_text = _extract_response_text(response)
+    parsed = extract_json_object(raw_text)
+
+    if parsed:
+        log("Groq verification completed with valid JSON.")
+        return normalize_groq_result(parsed, claim_type)
+
+    log("Groq returned non-JSON output; returning raw model output for review.", logging.WARNING)
+    return build_result(
+        status="Inaccurate",
+        confidence="Low",
+        claim_type=claim_type,
+        reasoning="Groq responded, but the response could not be parsed as valid JSON.",
+        evidence=raw_text or "Groq returned an empty response.",
+        source="Groq raw response",
+    )
+
+
+def _extract_response_text(response: Any) -> str:
+    """Safely extract text content from a Groq API response."""
+    try:
+        if response is None:
+            log("Groq response is None.", logging.WARNING)
+            return ""
+        choices = getattr(response, "choices", None)
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            log("Groq response contains no choices.", logging.WARNING)
+            return ""
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            log("Groq response choice has no message.", logging.WARNING)
+            return ""
+        content = getattr(message, "content", None)
+        return clean_text(content) if content is not None else ""
+    except Exception as error:
+        log(f"Failed to extract text from Groq response: {error}", logging.ERROR)
+        return ""
+
+
+def build_groq_prompt(claim: str, claim_type: str) -> str:
+    return f"""You are a professional fact-checking system. Your sole task is to verify the factual accuracy of the claim below.
+
+Claim: "{claim}"
+Claim Type: {claim_type}
+
+STRICT OUTPUT RULES — YOU MUST FOLLOW THESE EXACTLY:
+1. Return ONLY a single valid JSON object. No other text whatsoever.
+2. Do NOT include markdown, code fences, backticks, or any wrapper text.
+3. Do NOT include any explanation, preamble, or commentary outside the JSON.
+4. The JSON must be parseable by Python's json.loads() with no preprocessing.
+
+Required JSON structure (use exactly these keys):
+{{
+  "status": "Verified" | "Inaccurate" | "False",
+  "confidence": "High" | "Medium" | "Low",
+  "reasoning": "A clear, concise explanation of your verdict.",
+  "evidence": "Specific facts, data, or context that support your verdict.",
+  "source": "The knowledge domain used (e.g. Scientific consensus, Historical records, Geography, etc.)"
+}}
+
+IMPORTANT: Any response that is not a raw, valid JSON object will be treated as a failed verification.
+"""
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = strip_json_fences(text)
+    if not cleaned:
+        return None
+
+    for candidate in json_candidates(cleaned):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as error:
+            log(f"JSON parse failed: {error}", logging.DEBUG)
+            continue
+
+        if isinstance(parsed, dict):
+            return parsed
+
+    return None
+
+
+def json_candidates(text: str) -> list[str]:
+    candidates = [text.strip()]
+    candidates.extend(match.group(0).strip() for match in re.finditer(r"\{[\s\S]*\}", text))
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            _, end_index = decoder.raw_decode(text[match.start():])
+            candidates.append(text[match.start(): match.start() + end_index].strip())
+        except json.JSONDecodeError:
+            continue
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
+def strip_json_fences(text: str) -> str:
+    cleaned = clean_text(text)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def normalize_groq_result(result: dict[str, Any], claim_type: str) -> dict[str, str]:
+    return build_result(
+        status=clean_text(result.get("status")) or "Inaccurate",
+        confidence=clean_text(result.get("confidence")) or "Low",
+        claim_type=clean_text(result.get("type") or result.get("claim_type")) or claim_type,
+        reasoning=clean_text(result.get("reasoning") or result.get("reason")),
+        evidence=clean_text(result.get("evidence")),
+        source=clean_text(result.get("source")) or "Groq AI",
+        source_url=clean_text(result.get("source_url") or result.get("url")),
+    )
+
+
+def calibrate_result(result: dict[str, str]) -> dict[str, str]:
+    status = normalize_choice(result.get("status", "Inaccurate"), STATUS_VALUES, "Inaccurate")
+    confidence = normalize_choice(result.get("confidence", "Low"), CONFIDENCE_VALUES, "Low")
+    claim_type = normalize_choice(result.get("type", "Fact"), CLAIM_TYPES, "Fact")
+
+    result["status"] = status
+    result["confidence"] = confidence
+    result["type"] = claim_type
+    result["reasoning"] = clean_text(result.get("reasoning") or result.get("reason")) or "No reasoning was provided."
+    result["reason"] = result["reasoning"]
+    result["evidence"] = (clean_text(result.get("evidence")) or "No evidence was provided.")[:MAX_EVIDENCE_CHARS]
+    result["source"] = normalize_source(result.get("source"))
+    result["source_url"] = clean_text(result.get("source_url"))
+    return result
+
+
+def normalize_choice(value: Any, allowed_values: set[str], fallback: str) -> str:
+    cleaned = clean_text(value).replace("/", "|")
+    for allowed_value in allowed_values:
+        if re.search(rf"\b{re.escape(allowed_value)}\b", cleaned, flags=re.IGNORECASE):
+            return allowed_value
+    return fallback
+
+
+def classify_claim(claim: str) -> str:
+    text = clean_text(claim)
+    lower_text = text.lower()
+
+    if not text or len(text.split()) < 3:
         return "Opinion"
 
-    if NUMERIC_PATTERN.search(normalized) or any(term in lower_claim for term in STATISTIC_TERMS):
+    if re.search(r"[$]?\s?\d|%|\b(19|20)\d{2}\b", text):
         return "Statistic"
 
-    if any(re.search(rf"\b{re.escape(term)}\b", lower_claim) for term in OPINION_TERMS):
+    statistic_terms = {
+        "population",
+        "gdp",
+        "inflation",
+        "revenue",
+        "profit",
+        "loss",
+        "growth",
+        "rate",
+        "percentage",
+        "market share",
+        "valuation",
+        "users",
+        "million",
+        "billion",
+        "trillion",
+    }
+    if any(term in lower_text for term in statistic_terms):
+        return "Statistic"
+
+    opinion_terms = {
+        "best",
+        "worst",
+        "should",
+        "could",
+        "might",
+        "may",
+        "believe",
+        "think",
+        "feel",
+        "likely",
+        "unlikely",
+        "better",
+        "worse",
+        "important",
+        "significant",
+        "successful",
+        "popular",
+        "effective",
+        "leading",
+    }
+    if any(re.search(rf"\b{re.escape(term)}\b", lower_text) for term in opinion_terms):
         return "Opinion"
 
     return "Fact"
 
 
-def analyze_claim(claim, claim_type=None):
-    """Extract lightweight signals used by the verification and explanation stages."""
-    normalized = re.sub(r"\s+", " ", (claim or "")).strip()
-    lower_claim = normalized.lower()
-    claim_type = claim_type or classify_claim(normalized)
+def normalize_source(source: Any) -> str:
+    cleaned = clean_text(source)
+    if not cleaned:
+        return "Groq AI"
 
-    topics = sorted(term for term in STATISTIC_TERMS if term in lower_claim)
-    opinion_signals = sorted(term for term in OPINION_TERMS if re.search(rf"\b{re.escape(term)}\b", lower_claim))
-    fact_signals = sorted(term for term in FACT_TERMS if re.search(rf"\b{re.escape(term)}\b", lower_claim))
-    numbers = re.findall(NUMERIC_PATTERN, normalized)
+    vague_sources = {
+        "source",
+        "trusted type",
+        "unknown",
+        "n/a",
+        "none",
+        "ai",
+        "groq",
+    }
+    if cleaned.lower() in vague_sources:
+        return "Groq AI"
+
+    return cleaned[:120]
+
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def build_result(
+    status: str,
+    confidence: str,
+    claim_type: str,
+    reasoning: str,
+    evidence: str,
+    source: str,
+    source_url: str = "",
+) -> dict[str, str]:
+    status = normalize_choice(status, STATUS_VALUES, "Inaccurate")
+    confidence = normalize_choice(confidence, CONFIDENCE_VALUES, "Low")
+    claim_type = normalize_choice(claim_type, CLAIM_TYPES, "Fact")
+    reasoning = clean_text(reasoning) or "No reasoning was provided."
+    evidence = (clean_text(evidence) or "No evidence was provided.")[:MAX_EVIDENCE_CHARS]
+    source = normalize_source(source)
+    source_url = clean_text(source_url)
 
     return {
-        "claim": normalized,
+        "status": status,
+        "confidence": confidence,
         "type": claim_type,
-        "lower": lower_claim,
-        "tokens": _tokenize(normalized),
-        "topics": topics,
-        "opinion_signals": opinion_signals,
-        "fact_signals": fact_signals,
-        "has_number": bool(numbers),
-        "has_money": bool(re.search(r"[$₹€£]", normalized)),
-        "has_date": bool(re.search(r"\b(19|20)\d{2}\b|\b(q[1-4]|fy)\s?\d{2,4}\b", normalized, re.IGNORECASE)),
-        "word_count": len(normalized.split()),
-        "fingerprint": int(hashlib.sha256(normalized.encode("utf-8")).hexdigest(), 16) if normalized else 0,
+        "reasoning": reasoning,
+        "reason": reasoning,
+        "evidence": evidence,
+        "source": source,
+        "source_url": source_url,
     }
-
-
-def get_confidence(status, claim, analysis=None, match_score=0, matched_pattern=None):
-    """Return High, Medium, or Low based on decision strength and claim context."""
-    analysis = analysis or analyze_claim(claim)
-
-    if matched_pattern and status in {"Verified", "False"}:
-        return "High"
-
-    if analysis["type"] == "Statistic":
-        if status == "Verified" and ("population" in analysis["topics"] or match_score >= 0.72):
-            return "Medium"
-        if "gdp" in analysis["topics"] or "population" in analysis["topics"]:
-            return "Medium"
-        if any(topic in analysis["topics"] for topic in {"growth", "rate", "percentage"}) and match_score >= 0.35:
-            return "Medium"
-        return "Low"
-
-    if status == "Verified" and match_score >= 0.6:
-        return "Medium"
-
-    if status == "False":
-        return "Medium"
-
-    if analysis["type"] == "Opinion":
-        return "Low"
-
-    if analysis["fact_signals"] and analysis["word_count"] >= 6:
-        return "Medium"
-
-    return "Low"
-
-
-def generate_reasoning(claim, claim_type, status, analysis=None, context=None):
-    """Generate varied, context-aware reasoning for the final result."""
-    analysis = analysis or analyze_claim(claim, claim_type)
-    context = context or {}
-    topic = context.get("topic") or _primary_topic(analysis)
-    template = _pick_template(REASONING_TEMPLATES[status], analysis["fingerprint"])
-
-    if claim_type == "Statistic" and status == "Inaccurate":
-        if "gdp" in analysis["topics"]:
-            return "This GDP-related claim depends on reporting period, currency basis, and data source, so it is marked Inaccurate until checked against an official dataset."
-        if "population" in analysis["topics"]:
-            return "This population claim is numerical and may be broadly plausible, but exact figures shift over time and require a current demographic source."
-        if any(topic in analysis["topics"] for topic in {"growth", "rate", "percentage", "users", "revenue"}):
-            return "This claim includes performance or growth metrics that can vary by timeframe, so the system avoids a hard false label without primary validation."
-        return "This claim includes numerical data but lacks real-time authoritative validation, so it is marked as Inaccurate rather than False."
-
-    if claim_type == "Opinion":
-        signal = analysis["opinion_signals"][0] if analysis["opinion_signals"] else "subjective"
-        return f"The wording uses {signal!r} language, which makes the statement judgement-based rather than directly verifiable."
-
-    return template.format(topic=topic)
-
-
-def generate_explanation(claim, claim_type, status, analysis=None, context=None):
-    """Create evidence text that is natural and specific to the claim type."""
-    analysis = analysis or analyze_claim(claim, claim_type)
-    context = context or {}
-
-    if context.get("evidence"):
-        return context["evidence"]
-
-    if status == "False" and context.get("contradiction_evidence"):
-        return context["contradiction_evidence"]
-
-    if claim_type == "Statistic":
-        if "population" in analysis["topics"]:
-            return "Population figures are often supported by national statistical offices, UN-style estimates, or census releases; exact values depend on date and methodology."
-        if "gdp" in analysis["topics"]:
-            return "GDP figures should be validated against official sources such as national accounts, the World Bank, IMF, or government statistical releases."
-        if analysis["has_money"]:
-            return "Financial figures require source, currency, and reporting-period checks before they can be treated as verified."
-
-    template = _pick_template(EVIDENCE_TEMPLATES[claim_type], analysis["fingerprint"] // 7)
-    if context.get("web_summary"):
-        return f"{template} A lightweight lookup found related context: {context['web_summary']}"
-    return template
-
-
-def verify_claim(claim):
-    """
-    Multi-stage pipeline:
-    extract -> classify -> analyze -> verify -> explain.
-    """
-    try:
-        normalized = re.sub(r"\s+", " ", (claim or "")).strip()
-        if not normalized or len(normalized) < 12:
-            return _build_result(
-                status="Inaccurate",
-                claim_type="Opinion",
-                claim=normalized,
-                reason="The input is empty or too short to verify reliably.",
-                evidence="A professional fact-check requires a complete factual statement with enough context.",
-                source="AI heuristic engine",
-            )
-
-        claim_type = classify_claim(normalized)
-        analysis = analyze_claim(normalized, claim_type)
-        decision = _verify_with_layers(normalized, analysis)
-        status = decision["status"]
-        confidence = get_confidence(
-            status=status,
-            claim=normalized,
-            analysis=analysis,
-            match_score=decision.get("match_score", 0),
-            matched_pattern=decision.get("matched_pattern"),
-        )
-        reason = generate_reasoning(normalized, claim_type, status, analysis, decision)
-        evidence = generate_explanation(normalized, claim_type, status, analysis, decision)
-
-        return _build_result(
-            status=status,
-            confidence=confidence,
-            claim_type=claim_type,
-            reason=reason,
-            evidence=evidence,
-            source=decision.get("source", "AI heuristic engine"),
-        )
-    except Exception as error:
-        return _build_result(
-            status="Inaccurate",
-            confidence="Low",
-            claim_type="Fact",
-            reason="The verification pipeline hit an internal error and returned a safe manual-review result.",
-            evidence=f"Verification could not complete safely: {str(error)}",
-            source="AI heuristic engine",
-        )
-
-
-def _verify_with_layers(claim, analysis):
-    known = _match_known_patterns(analysis)
-    if known:
-        return known
-
-    if analysis["type"] == "Opinion":
-        return {
-            "status": "Inaccurate",
-            "source": "AI heuristic engine",
-            "topic": "subjective language",
-        }
-
-    web_result = _search_web(claim, analysis)
-    if web_result:
-        return web_result
-
-    return _heuristic_decision(analysis)
-
-
-def _match_known_patterns(analysis):
-    for item in KNOWN_CONTRADICTIONS:
-        if any(re.search(pattern, analysis["lower"]) for pattern in item["patterns"]):
-            return {
-                "status": "Inaccurate" if analysis["type"] == "Statistic" else "False",
-                "source": "AI heuristic engine",
-                "matched_pattern": item["label"],
-                "topic": item["domain"],
-                "contradiction_evidence": item["evidence"],
-            }
-
-    for item in KNOWN_FACTS:
-        if any(re.search(pattern, analysis["lower"]) for pattern in item["patterns"]):
-            return {
-                "status": "Verified",
-                "source": "AI heuristic engine",
-                "matched_pattern": item["label"],
-                "topic": item["domain"],
-                "evidence": item["evidence"],
-            }
-
-    return None
-
-
-def _search_web(claim, analysis):
-    """Optional no-key lookup. The app still works when network access is unavailable."""
-    try:
-        response = requests.get(
-            SEARCH_ENDPOINT,
-            params={
-                "q": claim,
-                "format": "json",
-                "no_html": 1,
-                "skip_disambig": 1,
-            },
-            timeout=5,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        evidence = data.get("AbstractText") or data.get("Answer")
-        source = data.get("AbstractURL") or data.get("AnswerType") or "DuckDuckGo Instant Answer + AI heuristic engine"
-        if evidence:
-            score = _match_score(claim, evidence)
-            if score >= 0.62 and analysis["type"] != "Statistic":
-                return {
-                    "status": "Verified",
-                    "source": source,
-                    "match_score": score,
-                    "web_summary": evidence[:240],
-                    "evidence": evidence[:700],
-                    "topic": _primary_topic(analysis),
-                }
-            return {
-                "status": "Inaccurate",
-                "source": source,
-                "match_score": score,
-                "web_summary": evidence[:240],
-                "topic": _primary_topic(analysis),
-            }
-
-        for topic in data.get("RelatedTopics", []):
-            if isinstance(topic, dict) and topic.get("Text"):
-                evidence = topic["Text"]
-                score = _match_score(claim, evidence)
-                if score >= 0.7 and analysis["type"] != "Statistic":
-                    status = "Verified"
-                else:
-                    status = "Inaccurate"
-                return {
-                    "status": status,
-                    "source": topic.get("FirstURL", "DuckDuckGo related result + AI heuristic engine"),
-                    "match_score": score,
-                    "web_summary": evidence[:240],
-                    "topic": _primary_topic(analysis),
-                }
-    except Exception:
-        return None
-
-    return None
-
-
-def _heuristic_decision(analysis):
-    if analysis["type"] == "Statistic":
-        status = "Verified" if _is_plausible_population_band(analysis) else "Inaccurate"
-        return {
-            "status": status,
-            "source": "AI heuristic engine",
-            "topic": _primary_topic(analysis),
-            "match_score": 0.58 if status == "Verified" else 0,
-            "matched_pattern": "Population plausibility band" if status == "Verified" else None,
-        }
-
-    if _looks_like_irrelevant_fragment(analysis):
-        return {
-            "status": "Inaccurate",
-            "source": "AI heuristic engine",
-            "topic": "insufficient context",
-        }
-
-    return {
-        "status": "Inaccurate",
-        "source": "AI heuristic engine",
-        "topic": _primary_topic(analysis),
-        "match_score": 0.35 if analysis["fact_signals"] else 0,
-    }
-
-
-def _build_result(status, claim_type, reason, evidence, source, confidence=None, claim=None):
-    allowed_statuses = {"Verified", "Inaccurate", "False"}
-    allowed_confidence = {"High", "Medium", "Low"}
-    allowed_types = {"Statistic", "Fact", "Opinion"}
-
-    if confidence is None:
-        confidence = "Low" if status == "Inaccurate" else "Medium"
-
-    return {
-        "status": status if status in allowed_statuses else "Inaccurate",
-        "confidence": confidence if confidence in allowed_confidence else "Low",
-        "type": claim_type if claim_type in allowed_types else "Fact",
-        "reason": reason or "The system could not generate a decisive explanation.",
-        "evidence": evidence or "No supporting evidence was available.",
-        "source": source or "AI heuristic engine",
-    }
-
-
-def _tokenize(text):
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "to",
-        "of",
-        "in",
-        "on",
-        "for",
-        "with",
-        "by",
-        "from",
-        "as",
-        "is",
-        "are",
-        "was",
-        "were",
-        "has",
-        "have",
-        "had",
-        "that",
-        "this",
-        "it",
-        "its",
-        "their",
-    }
-    return {
-        word
-        for word in re.findall(r"[a-z0-9]+", (text or "").lower())
-        if len(word) > 2 and word not in stopwords
-    }
-
-
-def _match_score(claim, evidence):
-    claim_tokens = _tokenize(claim)
-    evidence_tokens = _tokenize(evidence)
-    if not claim_tokens or not evidence_tokens:
-        return 0
-
-    overlap = len(claim_tokens & evidence_tokens) / len(claim_tokens)
-    similarity = SequenceMatcher(None, claim.lower(), evidence.lower()).ratio()
-    return max(overlap, similarity * 0.75)
-
-
-def _primary_topic(analysis):
-    if analysis["topics"]:
-        return analysis["topics"][0]
-    if analysis["type"] == "Statistic":
-        return "quantitative data"
-    if analysis["type"] == "Opinion":
-        return "subjective language"
-    return "general fact"
-
-
-def _pick_template(options, fingerprint):
-    return options[fingerprint % len(options)]
-
-
-def _is_plausible_population_band(analysis):
-    text = analysis["lower"]
-    return "population" in text and re.search(r"\b(7|8|9|seven|eight|nine)\b", text) and "billion" in text
-
-
-def _looks_like_irrelevant_fragment(analysis):
-    return analysis["word_count"] < 5 or (not analysis["fact_signals"] and len(analysis["tokens"]) < 4)
